@@ -52,6 +52,7 @@ class _ConnectorMetricName:
 
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
+    DEFERRED_LOOKUP_DEADLINE = "vllm:kv_offload_deferred_lookup_deadline_expirations"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
 
 
@@ -141,6 +142,13 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _ConnectorMetricName.ALLOCATION_FAILURE: OffloadingCounterMetadata(
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
+            ),
+        ),
+        _ConnectorMetricName.DEFERRED_LOOKUP_DEADLINE: OffloadingCounterMetadata(
+            documentation=(
+                "Number of requests whose deferred offload lookup outlived "
+                "deferred_lookup_timeout_s and forfeited external hits to "
+                "local recomputation."
             ),
         ),
     }

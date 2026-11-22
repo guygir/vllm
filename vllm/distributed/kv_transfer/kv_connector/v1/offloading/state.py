@@ -104,6 +104,9 @@ class SchedulerOffloadConfig(NamedTuple):
     retention_interval: int | None = None
     dcp_world_size: int = 1
     sync_load_budget_bytes: int = 0
+    # Wall-clock bound on a deferred offload lookup before the request
+    # forfeits external hits and recomputes locally (0 disables).
+    deferred_lookup_timeout_s: float = 5.0
     # KV bytes per token on one worker, summed over the offloaded groups.
     kv_bytes_per_token: int = 0
 
@@ -223,6 +226,15 @@ class SchedulerOffloadConfig(NamedTuple):
                         f"tokens_per_chunk ({config.tokens_per_chunk})."
                     )
 
+        deferred_lookup_timeout_s = float(
+            spec.extra_config.get("deferred_lookup_timeout_s", 5.0)
+        )
+        if deferred_lookup_timeout_s < 0:
+            raise ValueError(
+                f"deferred_lookup_timeout_s ({deferred_lookup_timeout_s}) "
+                f"must be non-negative (0 disables the deadline)."
+            )
+
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
@@ -237,6 +249,7 @@ class SchedulerOffloadConfig(NamedTuple):
             sync_load_budget_bytes=int(
                 spec.extra_config.get("sync_load_budget_bytes", 0)
             ),
+            deferred_lookup_timeout_s=deferred_lookup_timeout_s,
             kv_bytes_per_token=sum(
                 kv_cache_config.kv_cache_groups[g.group_id].page_size_bytes
                 // g.tokens_per_block
@@ -289,6 +302,10 @@ class RequestOffloadState:
     # A load for this request failed; all its later lookups, including after
     # preemption, skip the offloaded cache so a faulting load is not retried.
     load_failed: bool = False
+    # True once the deferred-lookup deadline expired; all later lookups for
+    # this request, including after preemption, skip the offloaded cache so
+    # the request recomputes locally (mirrors load_failed).
+    lookup_forfeited: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(

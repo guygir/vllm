@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 import weakref
 from collections.abc import Callable, Iterable
 from dataclasses import replace
@@ -7398,3 +7399,125 @@ def test_lookahead_partial_store_uses_checkpoint_hash(lookahead):
         make_offload_key(request.block_hashes[boundary // 4 - 1], g) in offered
         for g in [0, 1]
     )
+
+
+# ---------------------------------------------------------------------------
+# Deferred-lookup deadline and scheduler-side discovery tick.
+# ---------------------------------------------------------------------------
+
+
+def _make_deferred_lookup_request(scheduler, pending_result=LookupResult.HIT_PENDING):
+    """A request whose offload lookup defers: group 0's partial-tail anchor
+    chunk (position 12) is pending for the backend, while group 1 (recurrent)
+    confirms the boundary, so the pending answer is worth waiting for."""
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: set(), 1: set()}
+    )
+
+    def lookup(key, req_context):
+        if req_context.get_offload_key_position(key) == 12:
+            return (
+                pending_result if get_offload_group_idx(key) == 0 else LookupResult.HIT
+            )
+        return LookupResult.MISS
+
+    scheduler.manager.lookup.side_effect = lookup
+    return request, req_status
+
+
+def _make_real_time_runner(request_runner, **extra_config):
+    return request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        extra_config_overrides=extra_config,
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "pending_result", [LookupResult.RETRY, LookupResult.HIT_PENDING]
+)
+def test_deferred_lookup_deadline_forfeits_to_local_recompute(pending_result):
+    """A deferred lookup that outlives deferred_lookup_timeout_s gives up on
+    external hits and recomputes locally, once and for all (sticky)."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(scheduler, {0: set(), 1: set()})
+
+    def lookup(key, req_context):
+        if req_context.get_offload_key_position(key) == 12:
+            return (
+                pending_result if get_offload_group_idx(key) == 0 else LookupResult.HIT
+            )
+        return LookupResult.MISS
+
+    scheduler.manager.lookup.side_effect = lookup
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+
+    req_status = scheduler._req_status["req"]
+    assert req_status.deferred_lookup_start_time is not None
+    # Backdate the deferral clock past the deadline.
+    req_status.deferred_lookup_start_time -= (
+        scheduler.config.deferred_lookup_timeout_s + 1
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert req_status.lookup_forfeited
+    # The deferral clock was consumed by the expiration.
+    assert req_status.deferred_lookup_start_time is None
+
+    # Sticky: later lookups skip the manager entirely.
+    calls_before = scheduler.manager.lookup.call_count
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.manager.lookup.call_count == calls_before
+
+
+@pytest.mark.cpu_test
+def test_deferred_lookup_deadline_zero_disables_forfeit():
+    """deferred_lookup_timeout_s=0 disables the deadline: a lookup may defer
+    indefinitely, as before."""
+    scheduler = _make_partial_tail_scheduler(
+        change_config=lambda cfg: cfg._replace(deferred_lookup_timeout_s=0)
+    )
+    request, _ = _make_deferred_lookup_request(scheduler)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    req_status = scheduler._req_status["req"]
+    req_status.deferred_lookup_start_time -= 3600
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert not req_status.lookup_forfeited
+
+
+@pytest.mark.cpu_test
+def test_deferred_lookup_deadline_counted_and_request_completes(request_runner):
+    """End to end: a lookup that stays deferred past the deadline forfeits
+    (counter observed), and the request then recomputes locally and runs to
+    completion instead of waiting indefinitely."""
+    runner = _make_real_time_runner(request_runner, deferred_lookup_timeout_s=0.05)
+    runner.manager.lookup.return_value = LookupResult.RETRY
+    runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[1] * 4)
+
+    forfeited: list[str] = []
+
+    def outlive_deadline():
+        time.sleep(0.06)
+        # Capture the forfeit before the request finishes and its state is
+        # dropped from the connector scheduler.
+        forfeited.extend(
+            state.req.request_id
+            for state in runner.connector_scheduler._req_status.values()
+            if state.lookup_forfeited
+        )
+
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], post_step_fn=outlive_deadline)
+
+    # The request forfeited (and the run completing shows it was then
+    # scheduled and finished instead of waiting indefinitely).
+    assert forfeited == ["0"]
+    reduced = _reduce_kv_connector_stats(runner)
+    assert reduced[_ConnectorMetricName.DEFERRED_LOOKUP_DEADLINE] == 1

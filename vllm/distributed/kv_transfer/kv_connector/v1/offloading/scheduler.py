@@ -911,6 +911,34 @@ class OffloadingConnectorScheduler:
             req_context, request, self.config.kv_group_configs
         )
 
+    def _deferred_lookup_deadline_expired(
+        self, req_status: RequestOffloadState
+    ) -> bool:
+        """Whether a deferred lookup outlived `deferred_lookup_timeout_s`.
+
+        Consumes the deferral clock (the wait ends in a forfeit either way)
+        and counts the expiration. Non-positive timeout disables the
+        deadline. Only called while `deferred_lookup_start_time` is set.
+        """
+        timeout_s = self.config.deferred_lookup_timeout_s
+        if timeout_s <= 0:
+            return False
+        start_time = req_status.deferred_lookup_start_time
+        assert start_time is not None
+        if time.monotonic() - start_time <= timeout_s:
+            return False
+        self._maybe_observe_lookup_async_delay(req_status)
+        self._connector_stats.increase_counter(
+            _ConnectorMetricName.DEFERRED_LOOKUP_DEADLINE
+        )
+        logger.warning(
+            "Offload lookup for request %s stayed deferred for more than "
+            "%ss; giving up on external hits and recomputing locally.",
+            req_status.req.request_id,
+            timeout_s,
+        )
+        return True
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -966,12 +994,13 @@ class OffloadingConnectorScheduler:
         if (
             request.skip_reading_external_kv
             or req_status.load_failed
+            or req_status.lookup_forfeited
             or not self._offloading_enabled
             or not self.access_mode.can_read
         ):
             # A manager that cannot read is never queried, so it serves no
             # external hits; nor does an engine still waiting for its workers
-            # (async_init).
+            # (async_init). A forfeited lookup likewise recomputes locally.
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
@@ -983,6 +1012,9 @@ class OffloadingConnectorScheduler:
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start
+                elif self._deferred_lookup_deadline_expired(req_status):
+                    req_status.lookup_forfeited = True
+                    num_hit_tokens = 0
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
