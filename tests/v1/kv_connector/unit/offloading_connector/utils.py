@@ -291,6 +291,7 @@ class RequestRunner:
         worker_count: int = 1,
         retention_interval: int | None = None,
         speculative_config: Any | None = None,
+        max_num_batched_tokens: int = 1000,
     ):
         assert blocks_per_chunk == 1 or all(
             group.block_size == block_size for group in kv_cache_groups or ()
@@ -305,7 +306,7 @@ class RequestRunner:
 
         vllm_config = create_vllm_config(
             block_size=block_size,
-            max_num_batched_tokens=1000,
+            max_num_batched_tokens=max_num_batched_tokens,
             disable_hybrid_kv_cache_manager=False,
         )
         vllm_config.scheduler_config.async_scheduling = async_scheduling
@@ -806,6 +807,7 @@ def request_runner():
         worker_count=1,
         retention_interval=None,
         speculative_config=None,
+        max_num_batched_tokens=1000,
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -817,6 +819,7 @@ def request_runner():
             worker_count=worker_count,
             retention_interval=retention_interval,
             speculative_config=speculative_config,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
         runners.append(runner)
         return runner

@@ -7401,87 +7401,81 @@ def test_lookahead_partial_store_uses_checkpoint_hash(lookahead):
     )
 
 
-def _lookup_req_ids(manager: MagicMock) -> list[str]:
-    """Request ids of the manager's lookup() calls, in call order."""
-    return [c.args[1].req_id for c in manager.lookup.call_args_list]
-
-
-def test_tick_advances_lookup_the_scheduler_did_not_reach(request_runner):
-    """A waiting request the scheduler never examines (the running batch is
-    full) still has its lookup run every step until it resolves."""
-    runner = request_runner(block_size=4, num_gpu_blocks=100, async_scheduling=False)
-    runner.scheduler.max_num_active_reqs = 1
-    results = {"A": LookupResult.MISS, "B": LookupResult.RETRY}
-    runner.manager.lookup.side_effect = lambda key, ctx: results[ctx.req_id]
+def _make_tick_runner(request_runner, results: dict[str, LookupResult]):
+    """A runner with a 256-token step budget whose lookups answer per
+    request, `RETRY` by default."""
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=400,
+        async_scheduling=False,
+        max_num_batched_tokens=256,
+    )
+    runner.manager.lookup.side_effect = lambda key, ctx: results.get(
+        ctx.req_id, LookupResult.RETRY
+    )
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
-    tick_requests = runner.connector_scheduler._lookups_to_advance
+    return runner
 
-    runner.new_request(token_ids=[1] * 8, req_id="A")
-    runner.scheduler.schedule()
-    assert "A" in runner.scheduler.requests
-    assert runner.scheduler.requests["A"].status == RequestStatus.RUNNING
-    runner.new_request(token_ids=[2] * 8, req_id="B")
 
-    for _ in range(2):
-        runner.manager.lookup.reset_mock()
-        runner.scheduler.schedule()
-        assert "B" in _lookup_req_ids(runner.manager)
-        assert runner.scheduler.requests["B"].status == RequestStatus.WAITING
-        assert "B" in tick_requests
+def _schedule_cold_prefill_only(runner) -> list[Any]:
+    """Run a step in which cold prefill "A" takes the whole budget, so the
+    scheduler visits no waiting request. Returns the step's lookups."""
+    runner.manager.lookup.reset_mock()
+    assert runner.scheduler.schedule().num_scheduled_tokens == {"A": 256}
+    return runner.manager.lookup.call_args_list
 
+
+def _req_ids(lookups) -> list[str]:
+    return list(dict.fromkeys(c.args[1].req_id for c in lookups))
+
+
+def test_tick_advances_lookups_while_the_step_budget_is_full(request_runner):
+    """A waiting request the scheduler cannot visit still has its deferred
+    lookup run every step, until the lookup resolves."""
+    results = {"A": LookupResult.MISS}
+    runner = _make_tick_runner(request_runner, results)
+    runner.new_request(token_ids=list(range(2000)), req_id="A")
+    _schedule_cold_prefill_only(runner)
+    runner.new_request(token_ids=[1] * 32, req_id="B")
+
+    assert _req_ids(_schedule_cold_prefill_only(runner)) == ["B"]
+    assert _req_ids(_schedule_cold_prefill_only(runner)) == ["B"]
     results["B"] = LookupResult.MISS
-    runner.scheduler.schedule()
-    assert "B" not in tick_requests
-    runner.manager.lookup.reset_mock()
-    runner.scheduler.schedule()
-    assert "B" not in _lookup_req_ids(runner.manager)
+    assert _req_ids(_schedule_cold_prefill_only(runner)) == ["B"]
+    assert _req_ids(_schedule_cold_prefill_only(runner)) == []
 
 
-def test_tick_starts_at_the_local_hit_admission_reported(request_runner):
-    """The tick looks up the same chunks admission did: those past the local
-    prefix hit, not the chunks the GPU prefix cache already holds."""
-    runner = request_runner(block_size=4, num_gpu_blocks=100, async_scheduling=False)
-    runner.manager.lookup.return_value = LookupResult.RETRY
-    runner.new_request(token_ids=list(range(12)), req_id="C")
-    request = runner.scheduler.requests["C"]
-    scheduler = runner.connector_scheduler
+def test_tick_starts_past_the_local_prefix_hit(request_runner):
+    """The tick looks up the chunks admission did, past the GPU prefix-cache
+    hit, and skips a request admission already looked up in the step."""
+    results = {"P": LookupResult.MISS, "A": LookupResult.MISS}
+    runner = _make_tick_runner(request_runner, results)
+    prefix = [7] * 32
+    runner.new_request(token_ids=prefix, req_id="P")
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
-    assert scheduler.get_num_new_matched_tokens(request, 4) == (None, False)
-    admission_keys = [c.args[0] for c in runner.manager.lookup.call_args_list]
-    req_status = scheduler._req_status["C"]
-    assert req_status.group_states[0].offload_keys[0] not in admission_keys
+    # C defers past its 2-block local hit, then A is admitted.
+    runner.new_request(token_ids=prefix + [8] * 32, req_id="C")
+    runner.new_request(token_ids=list(range(2000)), req_id="A")
+    lookups = _schedule_cold_prefill_only(runner)
+    admission_keys = [c.args[0] for c in lookups if c.args[1].req_id == "C"]
+    assert len(admission_keys) == 2
 
-    scheduler._looked_up_this_step.clear()
-    runner.manager.lookup.reset_mock()
-    scheduler._advance_waiting_lookups()
-    scheduler._release_step()
-
-    assert [c.args[0] for c in runner.manager.lookup.call_args_list] == (admission_keys)
-    assert req_status.num_locally_computed_tokens == 4
-    assert req_status.deferred_lookup_start_time is not None
-    assert "C" in scheduler._lookups_to_advance
+    lookups = _schedule_cold_prefill_only(runner)
+    assert [c.args[0] for c in lookups] == admission_keys
 
 
-def test_tick_is_bounded_round_robin_and_skips_admitted_lookups(request_runner):
-    """Per step, the tick runs at most _MAX_LOOKUP_ADVANCES_PER_STEP lookups,
-    skips requests admission looked up this step, and resumes with the
-    requests it did not reach."""
-    runner = request_runner(block_size=4, num_gpu_blocks=100, async_scheduling=False)
-    runner.manager.lookup.return_value = LookupResult.RETRY
-    req_ids = [str(i) for i in range(40)]
+def test_tick_is_bounded_and_round_robin(request_runner):
+    """Each step ticks at most 32 waiting requests, resuming next step with
+    the requests it did not reach."""
+    runner = _make_tick_runner(request_runner, {"A": LookupResult.MISS})
+    runner.new_request(token_ids=list(range(2000)), req_id="A")
+    _schedule_cold_prefill_only(runner)
+    req_ids = [f"R{i}" for i in range(40)]
     for i, req_id in enumerate(req_ids):
-        runner.new_request(token_ids=[i] * 4, req_id=req_id)
-    scheduler = runner.connector_scheduler
+        runner.new_request(token_ids=[i + 1] * 16, req_id=req_id)
 
-    scheduler._looked_up_this_step = {"0"}
-    scheduler._advance_waiting_lookups()
-    first = list(dict.fromkeys(_lookup_req_ids(runner.manager)))
-    assert first == req_ids[1:33]
-
-    runner.manager.lookup.reset_mock()
-    scheduler._advance_waiting_lookups()
-    scheduler._release_step()
-    second = list(dict.fromkeys(_lookup_req_ids(runner.manager)))
-    assert second == ["0", *req_ids[33:], *req_ids[1:25]]
+    assert _req_ids(_schedule_cold_prefill_only(runner)) == req_ids[:32]
+    assert _req_ids(_schedule_cold_prefill_only(runner)) == req_ids[32:] + req_ids[:24]
