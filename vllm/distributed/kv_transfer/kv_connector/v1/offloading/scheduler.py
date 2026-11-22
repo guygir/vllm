@@ -71,6 +71,10 @@ logger = init_logger(__name__)
 # A cache reset fence held this long is reported once.
 _RESET_FENCE_WARN_S = 60
 
+# Lookups run per step for waiting requests the scheduler did not reach.
+# Each one scans the request's whole prefix on the scheduler thread.
+_MAX_LOOKUP_ADVANCES_PER_STEP = 32
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -294,6 +298,11 @@ class OffloadingConnectorScheduler:
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # Requests not yet looked up, or whose last lookup deferred, in the
+        # order the end-of-step tick advances them.
+        self._lookups_to_advance: dict[ReqId, None] = {}
+        # Requests the scheduler looked up in the current engine step
+        self._looked_up_this_step: set[ReqId] = set()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         # Requests loading synchronously in the current engine step
         self._current_batch_sync_loads: set[ReqId] = set()
@@ -437,6 +446,7 @@ class OffloadingConnectorScheduler:
     def _remove_request(self, req_id: ReqId) -> None:
         """Remove the state of a request, and tell each store handler."""
         del self._req_status[req_id]
+        self._lookups_to_advance.pop(req_id, None)
         for handler in self._store_handlers.values():
             handler.on_request_removed(req_id)
 
@@ -907,6 +917,7 @@ class OffloadingConnectorScheduler:
         except Exception:
             del self._req_status[request.request_id]
             raise
+        self._lookups_to_advance[request.request_id] = None
         self._events_tracker.on_new_request(
             req_context, request, self.config.kv_group_configs
         )
@@ -985,6 +996,11 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+        self._looked_up_this_step.add(request.request_id)
+        if num_hit_tokens is None:
+            self._lookups_to_advance.setdefault(request.request_id)
+        else:
+            self._lookups_to_advance.pop(request.request_id, None)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         sync_load = self._reserve_sync_load(
@@ -1346,6 +1362,62 @@ class OffloadingConnectorScheduler:
                     self._current_batch_jobs_to_flush.add(job_id)
         return job_id
 
+    def _advance_waiting_lookups(self) -> None:
+        """Run the lookups of waiting requests the scheduler did not reach.
+
+        A deferred lookup advances only when lookup() is called again (an
+        async probe's verdict starts a promotion, a promotion's completion
+        turns into a HIT), and the scheduler stops visiting waiting requests
+        once the token budget or the running batch is full. Running the
+        lookups here keeps them moving, so the request is ready to load when
+        it is next examined.
+
+        The result is discarded: admission re-runs the lookup before acting
+        on it, and owns request state (the deferral clock, the shared-prefix
+        junction). The lookup starts at the local prefix hit admission last
+        reported. A request admission has not examined yet has none, so its
+        lookup starts at the first chunk and may promote chunks the GPU
+        prefix cache already holds.
+        """
+        looked_up = self._looked_up_this_step
+        self._looked_up_this_step = set()
+        if (
+            not self._lookups_to_advance
+            or not self._offloading_enabled
+            or not self.access_mode.can_read
+        ):
+            return
+        num_advanced = 0
+        for req_id in list(self._lookups_to_advance):
+            if num_advanced == _MAX_LOOKUP_ADVANCES_PER_STEP:
+                break
+            if req_id in looked_up:
+                continue
+            req_status = self._req_status.get(req_id)
+            if (
+                req_status is None
+                or req_status.finished_signaled
+                or req_status.load_failed
+                or req_status.transfer_jobs
+                or req_status.req.skip_reading_external_kv
+                # Its block hashes may be recomputed before admission.
+                or (req_status.req.resumable and self.num_hash_lookahead_tokens)
+            ):
+                # Not waiting on a lookup admission would act on; admission
+                # re-adds it if it defers again.
+                del self._lookups_to_advance[req_id]
+                continue
+            num_advanced += 1
+            # Move to the back so the next step starts with the others.
+            del self._lookups_to_advance[req_id]
+            req_status.update_offload_keys()
+            complete_hit, boundary = self._lookup_complete_chunks(req_status)
+            if (
+                self._lookup_partial_tail_hit(req_status, complete_hit, boundary, None)
+                is None
+            ):
+                self._lookups_to_advance[req_id] = None
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1437,6 +1509,8 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
                 self._remove_request(req_id)
+        # Before on_schedule_end, which submits the promotions it starts.
+        self._advance_waiting_lookups()
         self._current_batch_load_jobs = {}
         self._current_batch_sync_loads = set()
         self._current_batch_sync_load_bytes = 0
