@@ -162,6 +162,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def advance_discovery(self, request: "Request", num_computed_tokens: int) -> bool:
+        """Delegate the scheduler-side discovery tick to the connector
+        scheduler (see OffloadingConnectorScheduler.advance_discovery)."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.advance_discovery(request, num_computed_tokens)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:

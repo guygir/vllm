@@ -306,6 +306,9 @@ class RequestOffloadState:
     # this request, including after preemption, skip the offloaded cache so
     # the request recomputes locally (mirrors load_failed).
     lookup_forfeited: bool = False
+    # True once any lookup path has queried the manager for this request;
+    # lets the scheduler-side discovery tick skip already-resolved lookups.
+    lookup_queried: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(

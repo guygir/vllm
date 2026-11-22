@@ -939,6 +939,61 @@ class OffloadingConnectorScheduler:
         )
         return True
 
+    def advance_discovery(self, request: Request, num_computed_tokens: int) -> bool:
+        """Advance the offload lookup of a waiting request without admitting
+        it.
+
+        Re-runs the metadata lookup for a request whose lookup is deferred
+        (or not yet queried), so managers that progress lookups inside
+        `lookup()` keep making progress while the request waits in the
+        queue, and the answer is likely ready by the time the scheduler
+        examines the request.
+
+        The result is discarded: allocation, admission and load decisions
+        are always made by `get_num_new_matched_tokens()` with fresh state
+        when the scheduler examines the request. The only lasting effects
+        are the lookup's own side effects (asynchronous lookup work kicked
+        forward, the manager's LRU touched), the deferral clock, and the
+        deferred-lookup deadline, which can fire here. Returns True if a
+        lookup was issued.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return False
+        if (
+            request.skip_reading_external_kv
+            or req_status.load_failed
+            or req_status.lookup_forfeited
+            or req_status.transfer_jobs
+            or not self._offloading_enabled
+            or not self.access_mode.can_read
+        ):
+            return False
+        if req_status.lookup_queried and req_status.deferred_lookup_start_time is None:
+            # Already queried and resolved; the admission path re-queries
+            # with fresh state when it examines the request.
+            return False
+        # Idempotent within a step; the region opened here (or by the
+        # admission loop) is released at the end of build_connector_meta.
+        self._acquire_step()
+        if request.resumable and self.num_hash_lookahead_tokens:
+            # Core may have recomputed block hashes after preemption.
+            for group_state in req_status.group_states:
+                group_state.offload_keys.clear()
+        req_status.update_offload_keys()
+        req_status.num_locally_computed_tokens = num_computed_tokens
+        lookup_start = time.monotonic()
+        num_hit_tokens = self._lookup(req_status, None)
+        req_status.lookup_queried = True
+        if num_hit_tokens is None:
+            if req_status.deferred_lookup_start_time is None:
+                req_status.deferred_lookup_start_time = lookup_start
+            elif self._deferred_lookup_deadline_expired(req_status):
+                req_status.lookup_forfeited = True
+        else:
+            self._maybe_observe_lookup_async_delay(req_status)
+        return True
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -1005,6 +1060,7 @@ class OffloadingConnectorScheduler:
         else:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
+            req_status.lookup_queried = True
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,

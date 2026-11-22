@@ -92,6 +92,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# Maximum number of waiting requests whose KV-connector lookup discovery
+# is advanced per scheduler step (see Scheduler.schedule). The tick
+# resumes where the previous pass left off (round-robin), so requests
+# beyond the cap are advanced on later steps.
+_DISCOVERY_TICK_MAX_REQUESTS = 32
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -172,6 +178,10 @@ class Scheduler(SchedulerInterface):
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
         self.connector = None
+        # Whether the connector opts into the scheduler-side discovery tick
+        # (see schedule); set once the connector exists.
+        self._connector_advances_discovery = False
+        self._discovery_tick_cursor = 0
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
         self.defer_block_free = False
@@ -188,6 +198,10 @@ class Scheduler(SchedulerInterface):
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
                 kv_cache_config=self.kv_cache_config,
+            )
+            self._connector_advances_discovery = (
+                type(self.connector).advance_discovery
+                is not KVConnectorBase_V1.advance_discovery
             )
             if self.log_stats:
                 self.connector_prefix_cache_stats = PrefixCacheStats()
@@ -1662,6 +1676,36 @@ class Scheduler(SchedulerInterface):
                 self.waiting.prepend_requests(step_skipped_waiting)
             if step_skipped_async_kv:
                 self.async_kv_waiting.prepend_requests(step_skipped_async_kv)
+
+            # Advance KV-connector lookup discovery for waiting requests
+            # that could not be examined this pass: a connector whose lookup
+            # for a request is still deferred keeps making progress while
+            # the request waits. Bounded per pass and round-robin across
+            # passes; the connector decides whether a request needs
+            # advancing, and any answer is discarded (the admission path
+            # re-queries with fresh state when it examines the request).
+            if self._connector_advances_discovery:
+                connector = self.connector
+                assert connector is not None
+                waiting_reqs = list(self.waiting)
+                if waiting_reqs:
+                    num_to_examine = min(
+                        _DISCOVERY_TICK_MAX_REQUESTS, len(waiting_reqs)
+                    )
+                    start = self._discovery_tick_cursor % len(waiting_reqs)
+                    for i in range(num_to_examine):
+                        request = waiting_reqs[(start + i) % len(waiting_reqs)]
+                        if (
+                            request.num_computed_tokens != 0
+                            or request.status is not RequestStatus.WAITING
+                        ):
+                            continue
+                        connector.advance_discovery(
+                            request, request.num_computed_tokens
+                        )
+                    self._discovery_tick_cursor = (start + num_to_examine) % len(
+                        waiting_reqs
+                    )
 
             # DP prefill balancing: on a step that admitted prefills (release),
             # record whether it was capacity-bound.

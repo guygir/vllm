@@ -2985,7 +2985,15 @@ def test_scheduler_reports_lookup_async_delay_on_resolve(request_runner):
         num_gpu_blocks=10,
         async_scheduling=False,
     )
-    runner.manager.lookup.side_effect = [LookupResult.RETRY, LookupResult.MISS]
+    # Defer the first query only; every later query (including the
+    # scheduler-side discovery tick, which re-queries deferred waiting
+    # requests) resolves, so the delay is reported exactly once.
+    deferred_once = [LookupResult.RETRY]
+
+    def lookup(key, req_context):
+        return deferred_once.pop(0) if deferred_once else LookupResult.MISS
+
+    runner.manager.lookup.side_effect = lookup
     runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
         generate_store_output([])
     )
@@ -3017,7 +3025,9 @@ def test_max_offload_tokens_zero_does_not_record_pending_lookups(request_runner)
     runner.run(decoded_tokens=[])
 
     tracker = runner.connector_scheduler._events_tracker
-    assert runner.manager.lookup.call_count == 3
+    # One pass: the admission path queries the three chunks, and the
+    # scheduler-side discovery tick re-queries them (the lookup defers).
+    assert runner.manager.lookup.call_count == 6
     assert not tracker._pending_event_metadata
     assert list(runner.connector_scheduler.take_events()) == []
 
@@ -7487,6 +7497,151 @@ def test_deferred_lookup_deadline_zero_disables_forfeit():
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
     assert not req_status.lookup_forfeited
+
+
+@pytest.mark.cpu_test
+def test_advance_discovery_requeries_only_unresolved_lookups():
+    """The discovery tick re-runs a deferred lookup (so backends that progress
+    lookups inside lookup() keep making progress), repeatedly while it stays
+    deferred, but stops once it resolved."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_deferred_lookup_request(scheduler)
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    calls = scheduler.manager.lookup.call_count
+    assert scheduler.advance_discovery(request, 0) is True
+    assert scheduler.manager.lookup.call_count > calls
+    # Still deferred: the tick keeps polling it.
+    calls = scheduler.manager.lookup.call_count
+    assert scheduler.advance_discovery(request, 0) is True
+    assert scheduler.manager.lookup.call_count > calls
+
+    # Resolve the lookup: the final tick re-queries once more, then stops.
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.MISS
+    assert scheduler.advance_discovery(request, 0) is True
+    calls = scheduler.manager.lookup.call_count
+    assert scheduler.advance_discovery(request, 0) is False
+    assert scheduler.manager.lookup.call_count == calls
+
+    # The admission path re-queries with fresh state after the tick resolved
+    # the lookup: the tick's answer was never treated as final.
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.manager.lookup.call_count > calls
+
+    # A request that skips reading external KV is never ticked.
+    request.skip_reading_external_kv = True
+    assert scheduler.advance_discovery(request, 0) is False
+
+
+@pytest.mark.cpu_test
+def test_advance_discovery_fires_deferred_lookup_deadline():
+    """The discovery tick maintains the deferred-lookup deadline: an expired
+    deferral forfeits during the tick, and the admission path then recomputes
+    locally without querying the manager."""
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_deferred_lookup_request(scheduler)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+
+    req_status = scheduler._req_status["req"]
+    req_status.deferred_lookup_start_time -= (
+        scheduler.config.deferred_lookup_timeout_s + 1
+    )
+
+    assert scheduler.advance_discovery(request, 0) is True
+    assert req_status.lookup_forfeited
+    # The forfeit also stops the tick.
+    assert scheduler.advance_discovery(request, 0) is False
+
+    calls_before = scheduler.manager.lookup.call_count
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.manager.lookup.call_count == calls_before
+
+
+@pytest.mark.cpu_test
+def test_discovery_tick_advances_waiting_requests(request_runner):
+    """The scheduler-side tick advances the offload lookups of waiting
+    requests: bounded per pass (32) and round-robin across passes."""
+    runner = _make_real_time_runner(request_runner)
+    runner.manager.lookup.return_value = LookupResult.RETRY
+    runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
+        generate_store_output([])
+    )
+
+    num_reqs = 40
+    for i in range(num_reqs):
+        # Distinct prompts: each request gets its own offload key, so
+        # per-request lookup counts can be told apart by the key.
+        runner.new_request(token_ids=[i] * 4, req_id=str(i))
+
+    runner.scheduler.schedule()
+
+    # Every waiting request was examined by the admission path (which
+    # re-queries deferred lookups each pass) ...
+    req_states = runner.connector_scheduler._req_status
+    assert len(req_states) == num_reqs
+    assert all(state.lookup_queried for state in req_states.values())
+    # ... and the tick advanced the first 32 (the per-pass cap).
+    assert runner.scheduler._discovery_tick_cursor == 32
+
+    # One 4-token chunk per request per query: 40 admission + 32 tick.
+    assert runner.manager.lookup.call_count == num_reqs + 32
+
+    # Second pass: the tick resumes after the 32 requests it already
+    # advanced (round-robin), wrapping around the queue.
+    runner.scheduler.schedule()
+    assert runner.scheduler._discovery_tick_cursor == 24
+
+    def lookup_counts():
+        counts: dict[Any, int] = {}
+        for call_args in runner.manager.lookup.call_args_list:
+            key = call_args.args[0]
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    counts = lookup_counts()
+    assert len(counts) == num_reqs
+    # Admission queried every request twice; the tick queried requests
+    # [0, 32) in pass one and [32, 40) + [0, 24) in pass two.
+    ticked_twice = sum(1 for count in counts.values() if count == 4)
+    ticked_once = sum(1 for count in counts.values() if count == 3)
+    assert ticked_twice == 24
+    assert ticked_once == 16
+    assert set(counts.values()) == {3, 4}
+
+
+@pytest.mark.cpu_test
+def test_discovery_tick_leaves_scheduled_requests_alone(request_runner):
+    """The tick only advances waiting requests: a request that resolved and
+    was scheduled (leaving WAITING) is never queried by the tick."""
+    runner = _make_real_time_runner(request_runner)
+    runner.manager.lookup.return_value = LookupResult.MISS
+    runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
+        generate_store_output([])
+    )
+
+    # A request that resolves immediately is scheduled (leaves WAITING).
+    runner.new_request(token_ids=[1, 1, 1, 1], req_id="scheduled")
+    scheduler_output = runner.scheduler.schedule()
+    assert {req.req_id for req in scheduler_output.scheduled_new_reqs} == {"scheduled"}
+
+    # A request whose lookup defers stays WAITING and is advanced by the tick.
+    runner.manager.lookup.return_value = LookupResult.RETRY
+    runner.new_request(token_ids=[2, 2, 2, 2], req_id="waiting")
+    runner.scheduler.schedule()
+
+    def lookup_count(req_id: str) -> int:
+        block_hash = runner.scheduler.requests[req_id].block_hashes[0]
+        return sum(
+            1
+            for call_args in runner.manager.lookup.call_args_list
+            if get_offload_block_hash(call_args.args[0]) == block_hash
+        )
+
+    # The scheduled request was queried once (admission) and never ticked;
+    # the waiting request was queried by admission and by the tick.
+    assert lookup_count("scheduled") == 1
+    assert lookup_count("waiting") == 2
 
 
 @pytest.mark.cpu_test

@@ -553,6 +553,32 @@ class KVConnectorBase_V1(ABC):
         """
         return self._kv_cache_config.prefix_cacheable_group_ids
 
+    def advance_discovery(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> bool:
+        """Advance the lookup of a waiting request the scheduler could not
+        examine.
+
+        Called by the scheduler at the end of a scheduling pass for a
+        bounded, round-robin selection of waiting requests that were not
+        admitted, so a connector whose `get_num_new_matched_tokens` is
+        still deferring a request can make progress on that lookup while
+        the request waits.
+
+        The result of any query issued here must not be treated as final:
+        the scheduler re-queries through `get_num_new_matched_tokens`
+        with fresh state when it examines the request. Implementations
+        should be side-effect-light apart from progressing the lookup
+        itself, and may be called multiple times per request.
+
+        Returns True if a lookup was issued. The default implementation
+        does nothing, so connectors whose lookups always resolve
+        synchronously are unaffected.
+        """
+        return False
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

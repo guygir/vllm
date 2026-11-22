@@ -502,6 +502,24 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         connector = self._connectors[self._requests_to_connector[request.request_id]]
         return connector.get_loaded_kv_cache_group_ids(request)
 
+    def advance_discovery(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> bool:
+        """Delegate the discovery tick to children that implement it.
+
+        Any child may still be deferring this request's lookup (the wrapper
+        defers while any child does), so every overriding child is queried.
+        Children that keep the base no-op are skipped.
+        """
+        queried = False
+        for c in self._connectors:
+            if type(c).advance_discovery is KVConnectorBase_V1.advance_discovery:
+                continue
+            queried |= c.advance_discovery(request, num_computed_tokens)
+        return queried
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
